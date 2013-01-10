@@ -44,5 +44,7 @@ tools/clang
 tools/lldb
 # lld, which is tracked independently.
 tools/lld
+# polly, which is tracked independently.
+tools/polly
 # Sphinx build tree, if building in-source dir.
 docs/_build
