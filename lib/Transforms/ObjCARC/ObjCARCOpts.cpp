@@ -1,4 +1,4 @@
-//===- ObjCARC.cpp - ObjC ARC Optimization --------------------------------===//
+//===- ObjCARCOpts.cpp - ObjC ARC Optimization ----------------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -28,16 +28,16 @@
 ///
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "objc-arc"
+#define DEBUG_TYPE "objc-arc-opts"
+#include "ObjCARC.h"
+#include "ObjCARCAliasAnalysis.h"
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/Support/CommandLine.h"
-#include "llvm/Support/Debug.h"
-#include "llvm/Support/raw_ostream.h"
-using namespace llvm;
+#include "llvm/ADT/STLExtras.h"
 
-/// \brief A handy option to enable/disable all optimizations in this file.
-static cl::opt<bool> EnableARCOpts("enable-objc-arc-opts", cl::init(true));
+using namespace llvm;
+using namespace llvm::objcarc;
 
 /// \defgroup MiscUtils Miscellaneous utilities that are not ARC specific.
 /// @{
@@ -132,117 +132,30 @@ namespace {
 /// \defgroup ARCUtilities Utility declarations/definitions specific to ARC.
 /// @{
 
-#include "llvm/ADT/StringSwitch.h"
-#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Intrinsics.h"
-#include "llvm/IR/Module.h"
 #include "llvm/Support/CallSite.h"
 #include "llvm/Transforms/Utils/Local.h"
 
-namespace {
-  /// \enum InstructionClass
-  /// \brief A simple classification for instructions.
-  enum InstructionClass {
-    IC_Retain,              ///< objc_retain
-    IC_RetainRV,            ///< objc_retainAutoreleasedReturnValue
-    IC_RetainBlock,         ///< objc_retainBlock
-    IC_Release,             ///< objc_release
-    IC_Autorelease,         ///< objc_autorelease
-    IC_AutoreleaseRV,       ///< objc_autoreleaseReturnValue
-    IC_AutoreleasepoolPush, ///< objc_autoreleasePoolPush
-    IC_AutoreleasepoolPop,  ///< objc_autoreleasePoolPop
-    IC_NoopCast,            ///< objc_retainedObject, etc.
-    IC_FusedRetainAutorelease, ///< objc_retainAutorelease
-    IC_FusedRetainAutoreleaseRV, ///< objc_retainAutoreleaseReturnValue
-    IC_LoadWeakRetained,    ///< objc_loadWeakRetained (primitive)
-    IC_StoreWeak,           ///< objc_storeWeak (primitive)
-    IC_InitWeak,            ///< objc_initWeak (derived)
-    IC_LoadWeak,            ///< objc_loadWeak (derived)
-    IC_MoveWeak,            ///< objc_moveWeak (derived)
-    IC_CopyWeak,            ///< objc_copyWeak (derived)
-    IC_DestroyWeak,         ///< objc_destroyWeak (derived)
-    IC_StoreStrong,         ///< objc_storeStrong (derived)
-    IC_CallOrUser,          ///< could call objc_release and/or "use" pointers
-    IC_Call,                ///< could call objc_release
-    IC_User,                ///< could "use" a pointer
-    IC_None                 ///< anything else
-  };
-
-  raw_ostream &operator<<(raw_ostream &OS, const InstructionClass Class)
-     LLVM_ATTRIBUTE_USED;
-  raw_ostream &operator<<(raw_ostream &OS, const InstructionClass Class) {
-    switch (Class) {
-    case IC_Retain:
-      return OS << "IC_Retain";
-    case IC_RetainRV:
-      return OS << "IC_RetainRV";
-    case IC_RetainBlock:
-      return OS << "IC_RetainBlock";
-    case IC_Release:
-      return OS << "IC_Release";
-    case IC_Autorelease:
-      return OS << "IC_Autorelease";
-    case IC_AutoreleaseRV:
-      return OS << "IC_AutoreleaseRV";
-    case IC_AutoreleasepoolPush:
-      return OS << "IC_AutoreleasepoolPush";
-    case IC_AutoreleasepoolPop:
-      return OS << "IC_AutoreleasepoolPop";
-    case IC_NoopCast:
-      return OS << "IC_NoopCast";
-    case IC_FusedRetainAutorelease:
-      return OS << "IC_FusedRetainAutorelease";
-    case IC_FusedRetainAutoreleaseRV:
-      return OS << "IC_FusedRetainAutoreleaseRV";
-    case IC_LoadWeakRetained:
-      return OS << "IC_LoadWeakRetained";
-    case IC_StoreWeak:
-      return OS << "IC_StoreWeak";
-    case IC_InitWeak:
-      return OS << "IC_InitWeak";
-    case IC_LoadWeak:
-      return OS << "IC_LoadWeak";
-    case IC_MoveWeak:
-      return OS << "IC_MoveWeak";
-    case IC_CopyWeak:
-      return OS << "IC_CopyWeak";
-    case IC_DestroyWeak:
-      return OS << "IC_DestroyWeak";
-    case IC_StoreStrong:
-      return OS << "IC_StoreStrong";
-    case IC_CallOrUser:
-      return OS << "IC_CallOrUser";
-    case IC_Call:
-      return OS << "IC_Call";
-    case IC_User:
-      return OS << "IC_User";
-    case IC_None:
-      return OS << "IC_None";
-    }
-    llvm_unreachable("Unknown instruction class!");
-  }
-}
-
-/// \brief Test whether the given value is possible a reference-counted pointer.
-static bool IsPotentialUse(const Value *Op) {
-  // Pointers to static or stack storage are not reference-counted pointers.
+/// \brief Test whether the given value is possible a retainable object pointer.
+static bool IsPotentialRetainableObjPtr(const Value *Op) {
+  // Pointers to static or stack storage are not valid retainable object pointers.
   if (isa<Constant>(Op) || isa<AllocaInst>(Op))
     return false;
-  // Special arguments are not reference-counted.
+  // Special arguments can not be a valid retainable object pointer.
   if (const Argument *Arg = dyn_cast<Argument>(Op))
     if (Arg->hasByValAttr() ||
         Arg->hasNestAttr() ||
         Arg->hasStructRetAttr())
       return false;
   // Only consider values with pointer types.
+  //
   // It seemes intuitive to exclude function pointer types as well, since
-  // functions are never reference-counted, however clang occasionally
-  // bitcasts reference-counted pointers to function-pointer type
-  // temporarily.
+  // functions are never retainable object pointers, however clang occasionally
+  // bitcasts retainable object pointers to function-pointer type temporarily.
   PointerType *Ty = dyn_cast<PointerType>(Op->getType());
   if (!Ty)
     return false;
-  // Conservatively assume anything else is a potential use.
+  // Conservatively assume anything else is a potential retainable object pointer.
   return true;
 }
 
@@ -251,83 +164,10 @@ static bool IsPotentialUse(const Value *Op) {
 static InstructionClass GetCallSiteClass(ImmutableCallSite CS) {
   for (ImmutableCallSite::arg_iterator I = CS.arg_begin(), E = CS.arg_end();
        I != E; ++I)
-    if (IsPotentialUse(*I))
+    if (IsPotentialRetainableObjPtr(*I))
       return CS.onlyReadsMemory() ? IC_User : IC_CallOrUser;
 
   return CS.onlyReadsMemory() ? IC_None : IC_Call;
-}
-
-/// \brief Determine if F is one of the special known Functions.  If it isn't,
-/// return IC_CallOrUser.
-static InstructionClass GetFunctionClass(const Function *F) {
-  Function::const_arg_iterator AI = F->arg_begin(), AE = F->arg_end();
-
-  // No arguments.
-  if (AI == AE)
-    return StringSwitch<InstructionClass>(F->getName())
-      .Case("objc_autoreleasePoolPush",  IC_AutoreleasepoolPush)
-      .Default(IC_CallOrUser);
-
-  // One argument.
-  const Argument *A0 = AI++;
-  if (AI == AE)
-    // Argument is a pointer.
-    if (PointerType *PTy = dyn_cast<PointerType>(A0->getType())) {
-      Type *ETy = PTy->getElementType();
-      // Argument is i8*.
-      if (ETy->isIntegerTy(8))
-        return StringSwitch<InstructionClass>(F->getName())
-          .Case("objc_retain",                IC_Retain)
-          .Case("objc_retainAutoreleasedReturnValue", IC_RetainRV)
-          .Case("objc_retainBlock",           IC_RetainBlock)
-          .Case("objc_release",               IC_Release)
-          .Case("objc_autorelease",           IC_Autorelease)
-          .Case("objc_autoreleaseReturnValue", IC_AutoreleaseRV)
-          .Case("objc_autoreleasePoolPop",    IC_AutoreleasepoolPop)
-          .Case("objc_retainedObject",        IC_NoopCast)
-          .Case("objc_unretainedObject",      IC_NoopCast)
-          .Case("objc_unretainedPointer",     IC_NoopCast)
-          .Case("objc_retain_autorelease",    IC_FusedRetainAutorelease)
-          .Case("objc_retainAutorelease",     IC_FusedRetainAutorelease)
-          .Case("objc_retainAutoreleaseReturnValue",IC_FusedRetainAutoreleaseRV)
-          .Default(IC_CallOrUser);
-
-      // Argument is i8**
-      if (PointerType *Pte = dyn_cast<PointerType>(ETy))
-        if (Pte->getElementType()->isIntegerTy(8))
-          return StringSwitch<InstructionClass>(F->getName())
-            .Case("objc_loadWeakRetained",      IC_LoadWeakRetained)
-            .Case("objc_loadWeak",              IC_LoadWeak)
-            .Case("objc_destroyWeak",           IC_DestroyWeak)
-            .Default(IC_CallOrUser);
-    }
-
-  // Two arguments, first is i8**.
-  const Argument *A1 = AI++;
-  if (AI == AE)
-    if (PointerType *PTy = dyn_cast<PointerType>(A0->getType()))
-      if (PointerType *Pte = dyn_cast<PointerType>(PTy->getElementType()))
-        if (Pte->getElementType()->isIntegerTy(8))
-          if (PointerType *PTy1 = dyn_cast<PointerType>(A1->getType())) {
-            Type *ETy1 = PTy1->getElementType();
-            // Second argument is i8*
-            if (ETy1->isIntegerTy(8))
-              return StringSwitch<InstructionClass>(F->getName())
-                     .Case("objc_storeWeak",             IC_StoreWeak)
-                     .Case("objc_initWeak",              IC_InitWeak)
-                     .Case("objc_storeStrong",           IC_StoreStrong)
-                     .Default(IC_CallOrUser);
-            // Second argument is i8**.
-            if (PointerType *Pte1 = dyn_cast<PointerType>(ETy1))
-              if (Pte1->getElementType()->isIntegerTy(8))
-                return StringSwitch<InstructionClass>(F->getName())
-                       .Case("objc_moveWeak",              IC_MoveWeak)
-                       .Case("objc_copyWeak",              IC_CopyWeak)
-                       .Default(IC_CallOrUser);
-          }
-
-  // Anything else.
-  return IC_CallOrUser;
 }
 
 /// \brief Determine what kind of construct V is.
@@ -400,7 +240,7 @@ static InstructionClass GetInstructionClass(const Value *V) {
       // Comparing a pointer with null, or any other constant, isn't an
       // interesting use, because we don't care what the pointer points to, or
       // about the values of any other dynamic reference-counted pointers.
-      if (IsPotentialUse(I->getOperand(1)))
+      if (IsPotentialRetainableObjPtr(I->getOperand(1)))
         return IC_User;
       break;
     default:
@@ -411,100 +251,13 @@ static InstructionClass GetInstructionClass(const Value *V) {
       // it, so we have to consider it potentially used.
       for (User::const_op_iterator OI = I->op_begin(), OE = I->op_end();
            OI != OE; ++OI)
-        if (IsPotentialUse(*OI))
+        if (IsPotentialRetainableObjPtr(*OI))
           return IC_User;
     }
   }
 
   // Otherwise, it's totally inert for ARC purposes.
   return IC_None;
-}
-
-/// \brief Determine which objc runtime call instruction class V belongs to.
-///
-/// This is similar to GetInstructionClass except that it only detects objc
-/// runtime calls. This allows it to be faster.
-///
-static InstructionClass GetBasicInstructionClass(const Value *V) {
-  if (const CallInst *CI = dyn_cast<CallInst>(V)) {
-    if (const Function *F = CI->getCalledFunction())
-      return GetFunctionClass(F);
-    // Otherwise, be conservative.
-    return IC_CallOrUser;
-  }
-
-  // Otherwise, be conservative.
-  return isa<InvokeInst>(V) ? IC_CallOrUser : IC_User;
-}
-
-/// \brief Test if the given class is objc_retain or equivalent.
-static bool IsRetain(InstructionClass Class) {
-  return Class == IC_Retain ||
-         Class == IC_RetainRV;
-}
-
-/// \brief Test if the given class is objc_autorelease or equivalent.
-static bool IsAutorelease(InstructionClass Class) {
-  return Class == IC_Autorelease ||
-         Class == IC_AutoreleaseRV;
-}
-
-/// \brief Test if the given class represents instructions which return their
-/// argument verbatim.
-static bool IsForwarding(InstructionClass Class) {
-  // objc_retainBlock technically doesn't always return its argument
-  // verbatim, but it doesn't matter for our purposes here.
-  return Class == IC_Retain ||
-         Class == IC_RetainRV ||
-         Class == IC_Autorelease ||
-         Class == IC_AutoreleaseRV ||
-         Class == IC_RetainBlock ||
-         Class == IC_NoopCast;
-}
-
-/// \brief Test if the given class represents instructions which do nothing if
-/// passed a null pointer.
-static bool IsNoopOnNull(InstructionClass Class) {
-  return Class == IC_Retain ||
-         Class == IC_RetainRV ||
-         Class == IC_Release ||
-         Class == IC_Autorelease ||
-         Class == IC_AutoreleaseRV ||
-         Class == IC_RetainBlock;
-}
-
-/// \brief Test if the given class represents instructions which are always safe
-/// to mark with the "tail" keyword.
-static bool IsAlwaysTail(InstructionClass Class) {
-  // IC_RetainBlock may be given a stack argument.
-  return Class == IC_Retain ||
-         Class == IC_RetainRV ||
-         Class == IC_AutoreleaseRV;
-}
-
-/// \brief Test if the given class represents instructions which are never safe
-/// to mark with the "tail" keyword.
-static bool IsNeverTail(InstructionClass Class) {
-  /// It is never safe to tail call objc_autorelease since by tail calling
-  /// objc_autorelease, we also tail call -[NSObject autorelease] which supports
-  /// fast autoreleasing causing our object to be potentially reclaimed from the
-  /// autorelease pool which violates the semantics of __autoreleasing types in
-  /// ARC.
-  return Class == IC_Autorelease;
-}
-
-/// \brief Test if the given class represents instructions which are always safe
-/// to mark with the nounwind attribute.
-static bool IsNoThrow(InstructionClass Class) {
-  // objc_retainBlock is not nounwind because it calls user copy constructors
-  // which could theoretically throw.
-  return Class == IC_Retain ||
-         Class == IC_RetainRV ||
-         Class == IC_Release ||
-         Class == IC_Autorelease ||
-         Class == IC_AutoreleaseRV ||
-         Class == IC_AutoreleasepoolPush ||
-         Class == IC_AutoreleasepoolPop;
 }
 
 /// \brief Erase the given instruction.
@@ -529,46 +282,6 @@ static void EraseInstruction(Instruction *CI) {
 
   if (Unused)
     RecursivelyDeleteTriviallyDeadInstructions(OldArg);
-}
-
-/// \brief This is a wrapper around getUnderlyingObject which also knows how to
-/// look through objc_retain and objc_autorelease calls, which we know to return
-/// their argument verbatim.
-static const Value *GetUnderlyingObjCPtr(const Value *V) {
-  for (;;) {
-    V = GetUnderlyingObject(V);
-    if (!IsForwarding(GetBasicInstructionClass(V)))
-      break;
-    V = cast<CallInst>(V)->getArgOperand(0);
-  }
-
-  return V;
-}
-
-/// \brief This is a wrapper around Value::stripPointerCasts which also knows
-/// how to look through objc_retain and objc_autorelease calls, which we know to
-/// return their argument verbatim.
-static const Value *StripPointerCastsAndObjCCalls(const Value *V) {
-  for (;;) {
-    V = V->stripPointerCasts();
-    if (!IsForwarding(GetBasicInstructionClass(V)))
-      break;
-    V = cast<CallInst>(V)->getArgOperand(0);
-  }
-  return V;
-}
-
-/// \brief This is a wrapper around Value::stripPointerCasts which also knows
-/// how to look through objc_retain and objc_autorelease calls, which we know to
-/// return their argument verbatim.
-static Value *StripPointerCastsAndObjCCalls(Value *V) {
-  for (;;) {
-    V = V->stripPointerCasts();
-    if (!IsForwarding(GetBasicInstructionClass(V)))
-      break;
-    V = cast<CallInst>(V)->getArgOperand(0);
-  }
-  return V;
 }
 
 /// \brief Assuming the given instruction is one of the special calls such as
@@ -646,29 +359,6 @@ static const Value *FindSingleUseIdentifiedObject(const Value *Arg) {
   }
 
   return 0;
-}
-
-/// \brief Test if the given module looks interesting to run ARC optimization
-/// on.
-static bool ModuleHasARC(const Module &M) {
-  return
-    M.getNamedValue("objc_retain") ||
-    M.getNamedValue("objc_release") ||
-    M.getNamedValue("objc_autorelease") ||
-    M.getNamedValue("objc_retainAutoreleasedReturnValue") ||
-    M.getNamedValue("objc_retainBlock") ||
-    M.getNamedValue("objc_autoreleaseReturnValue") ||
-    M.getNamedValue("objc_autoreleasePoolPush") ||
-    M.getNamedValue("objc_loadWeakRetained") ||
-    M.getNamedValue("objc_loadWeak") ||
-    M.getNamedValue("objc_destroyWeak") ||
-    M.getNamedValue("objc_storeWeak") ||
-    M.getNamedValue("objc_initWeak") ||
-    M.getNamedValue("objc_moveWeak") ||
-    M.getNamedValue("objc_copyWeak") ||
-    M.getNamedValue("objc_retainedObject") ||
-    M.getNamedValue("objc_unretainedObject") ||
-    M.getNamedValue("objc_unretainedPointer");
 }
 
 /// \brief Test whether the given pointer, which is an Objective C block
@@ -749,417 +439,6 @@ static bool DoesObjCBlockEscape(const Value *BlockPtr) {
   // No escapes found.
   DEBUG(dbgs() << "DoesObjCBlockEscape: Block does not escape.\n");
   return false;
-}
-
-/// @}
-///
-/// \defgroup ARCAA Extends alias analysis using ObjC specific knowledge.
-/// @{
-
-#include "llvm/Analysis/AliasAnalysis.h"
-#include "llvm/Analysis/Passes.h"
-#include "llvm/Pass.h"
-
-namespace {
-  /// \brief This is a simple alias analysis implementation that uses knowledge
-  /// of ARC constructs to answer queries.
-  ///
-  /// TODO: This class could be generalized to know about other ObjC-specific
-  /// tricks. Such as knowing that ivars in the non-fragile ABI are non-aliasing
-  /// even though their offsets are dynamic.
-  class ObjCARCAliasAnalysis : public ImmutablePass,
-                               public AliasAnalysis {
-  public:
-    static char ID; // Class identification, replacement for typeinfo
-    ObjCARCAliasAnalysis() : ImmutablePass(ID) {
-      initializeObjCARCAliasAnalysisPass(*PassRegistry::getPassRegistry());
-    }
-
-  private:
-    virtual void initializePass() {
-      InitializeAliasAnalysis(this);
-    }
-
-    /// This method is used when a pass implements an analysis interface through
-    /// multiple inheritance.  If needed, it should override this to adjust the
-    /// this pointer as needed for the specified pass info.
-    virtual void *getAdjustedAnalysisPointer(const void *PI) {
-      if (PI == &AliasAnalysis::ID)
-        return static_cast<AliasAnalysis *>(this);
-      return this;
-    }
-
-    virtual void getAnalysisUsage(AnalysisUsage &AU) const;
-    virtual AliasResult alias(const Location &LocA, const Location &LocB);
-    virtual bool pointsToConstantMemory(const Location &Loc, bool OrLocal);
-    virtual ModRefBehavior getModRefBehavior(ImmutableCallSite CS);
-    virtual ModRefBehavior getModRefBehavior(const Function *F);
-    virtual ModRefResult getModRefInfo(ImmutableCallSite CS,
-                                       const Location &Loc);
-    virtual ModRefResult getModRefInfo(ImmutableCallSite CS1,
-                                       ImmutableCallSite CS2);
-  };
-}  // End of anonymous namespace
-
-// Register this pass...
-char ObjCARCAliasAnalysis::ID = 0;
-INITIALIZE_AG_PASS(ObjCARCAliasAnalysis, AliasAnalysis, "objc-arc-aa",
-                   "ObjC-ARC-Based Alias Analysis", false, true, false)
-
-ImmutablePass *llvm::createObjCARCAliasAnalysisPass() {
-  return new ObjCARCAliasAnalysis();
-}
-
-void
-ObjCARCAliasAnalysis::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.setPreservesAll();
-  AliasAnalysis::getAnalysisUsage(AU);
-}
-
-AliasAnalysis::AliasResult
-ObjCARCAliasAnalysis::alias(const Location &LocA, const Location &LocB) {
-  if (!EnableARCOpts)
-    return AliasAnalysis::alias(LocA, LocB);
-
-  // First, strip off no-ops, including ObjC-specific no-ops, and try making a
-  // precise alias query.
-  const Value *SA = StripPointerCastsAndObjCCalls(LocA.Ptr);
-  const Value *SB = StripPointerCastsAndObjCCalls(LocB.Ptr);
-  AliasResult Result =
-    AliasAnalysis::alias(Location(SA, LocA.Size, LocA.TBAATag),
-                         Location(SB, LocB.Size, LocB.TBAATag));
-  if (Result != MayAlias)
-    return Result;
-
-  // If that failed, climb to the underlying object, including climbing through
-  // ObjC-specific no-ops, and try making an imprecise alias query.
-  const Value *UA = GetUnderlyingObjCPtr(SA);
-  const Value *UB = GetUnderlyingObjCPtr(SB);
-  if (UA != SA || UB != SB) {
-    Result = AliasAnalysis::alias(Location(UA), Location(UB));
-    // We can't use MustAlias or PartialAlias results here because
-    // GetUnderlyingObjCPtr may return an offsetted pointer value.
-    if (Result == NoAlias)
-      return NoAlias;
-  }
-
-  // If that failed, fail. We don't need to chain here, since that's covered
-  // by the earlier precise query.
-  return MayAlias;
-}
-
-bool
-ObjCARCAliasAnalysis::pointsToConstantMemory(const Location &Loc,
-                                             bool OrLocal) {
-  if (!EnableARCOpts)
-    return AliasAnalysis::pointsToConstantMemory(Loc, OrLocal);
-
-  // First, strip off no-ops, including ObjC-specific no-ops, and try making
-  // a precise alias query.
-  const Value *S = StripPointerCastsAndObjCCalls(Loc.Ptr);
-  if (AliasAnalysis::pointsToConstantMemory(Location(S, Loc.Size, Loc.TBAATag),
-                                            OrLocal))
-    return true;
-
-  // If that failed, climb to the underlying object, including climbing through
-  // ObjC-specific no-ops, and try making an imprecise alias query.
-  const Value *U = GetUnderlyingObjCPtr(S);
-  if (U != S)
-    return AliasAnalysis::pointsToConstantMemory(Location(U), OrLocal);
-
-  // If that failed, fail. We don't need to chain here, since that's covered
-  // by the earlier precise query.
-  return false;
-}
-
-AliasAnalysis::ModRefBehavior
-ObjCARCAliasAnalysis::getModRefBehavior(ImmutableCallSite CS) {
-  // We have nothing to do. Just chain to the next AliasAnalysis.
-  return AliasAnalysis::getModRefBehavior(CS);
-}
-
-AliasAnalysis::ModRefBehavior
-ObjCARCAliasAnalysis::getModRefBehavior(const Function *F) {
-  if (!EnableARCOpts)
-    return AliasAnalysis::getModRefBehavior(F);
-
-  switch (GetFunctionClass(F)) {
-  case IC_NoopCast:
-    return DoesNotAccessMemory;
-  default:
-    break;
-  }
-
-  return AliasAnalysis::getModRefBehavior(F);
-}
-
-AliasAnalysis::ModRefResult
-ObjCARCAliasAnalysis::getModRefInfo(ImmutableCallSite CS, const Location &Loc) {
-  if (!EnableARCOpts)
-    return AliasAnalysis::getModRefInfo(CS, Loc);
-
-  switch (GetBasicInstructionClass(CS.getInstruction())) {
-  case IC_Retain:
-  case IC_RetainRV:
-  case IC_Autorelease:
-  case IC_AutoreleaseRV:
-  case IC_NoopCast:
-  case IC_AutoreleasepoolPush:
-  case IC_FusedRetainAutorelease:
-  case IC_FusedRetainAutoreleaseRV:
-    // These functions don't access any memory visible to the compiler.
-    // Note that this doesn't include objc_retainBlock, because it updates
-    // pointers when it copies block data.
-    return NoModRef;
-  default:
-    break;
-  }
-
-  return AliasAnalysis::getModRefInfo(CS, Loc);
-}
-
-AliasAnalysis::ModRefResult
-ObjCARCAliasAnalysis::getModRefInfo(ImmutableCallSite CS1,
-                                    ImmutableCallSite CS2) {
-  // TODO: Theoretically we could check for dependencies between objc_* calls
-  // and OnlyAccessesArgumentPointees calls or other well-behaved calls.
-  return AliasAnalysis::getModRefInfo(CS1, CS2);
-}
-
-/// @}
-///
-/// \defgroup ARCExpansion Early ARC Optimizations.
-/// @{
-
-#include "llvm/Support/InstIterator.h"
-#include "llvm/Transforms/Scalar.h"
-
-namespace {
-  /// \brief Early ARC transformations.
-  class ObjCARCExpand : public FunctionPass {
-    virtual void getAnalysisUsage(AnalysisUsage &AU) const;
-    virtual bool doInitialization(Module &M);
-    virtual bool runOnFunction(Function &F);
-
-    /// A flag indicating whether this optimization pass should run.
-    bool Run;
-
-  public:
-    static char ID;
-    ObjCARCExpand() : FunctionPass(ID) {
-      initializeObjCARCExpandPass(*PassRegistry::getPassRegistry());
-    }
-  };
-}
-
-char ObjCARCExpand::ID = 0;
-INITIALIZE_PASS(ObjCARCExpand,
-                "objc-arc-expand", "ObjC ARC expansion", false, false)
-
-Pass *llvm::createObjCARCExpandPass() {
-  return new ObjCARCExpand();
-}
-
-void ObjCARCExpand::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.setPreservesCFG();
-}
-
-bool ObjCARCExpand::doInitialization(Module &M) {
-  Run = ModuleHasARC(M);
-  return false;
-}
-
-bool ObjCARCExpand::runOnFunction(Function &F) {
-  if (!EnableARCOpts)
-    return false;
-
-  // If nothing in the Module uses ARC, don't do anything.
-  if (!Run)
-    return false;
-
-  bool Changed = false;
-
-  DEBUG(dbgs() << "ObjCARCExpand: Visiting Function: " << F.getName() << "\n");
-
-  for (inst_iterator I = inst_begin(&F), E = inst_end(&F); I != E; ++I) {
-    Instruction *Inst = &*I;
-
-    DEBUG(dbgs() << "ObjCARCExpand: Visiting: " << *Inst << "\n");
-
-    switch (GetBasicInstructionClass(Inst)) {
-    case IC_Retain:
-    case IC_RetainRV:
-    case IC_Autorelease:
-    case IC_AutoreleaseRV:
-    case IC_FusedRetainAutorelease:
-    case IC_FusedRetainAutoreleaseRV: {
-      // These calls return their argument verbatim, as a low-level
-      // optimization. However, this makes high-level optimizations
-      // harder. Undo any uses of this optimization that the front-end
-      // emitted here. We'll redo them in the contract pass.
-      Changed = true;
-      Value *Value = cast<CallInst>(Inst)->getArgOperand(0);
-      DEBUG(dbgs() << "ObjCARCExpand: Old = " << *Inst << "\n"
-                      "               New = " << *Value << "\n");
-      Inst->replaceAllUsesWith(Value);
-      break;
-    }
-    default:
-      break;
-    }
-  }
-
-  DEBUG(dbgs() << "ObjCARCExpand: Finished List.\n\n");
-
-  return Changed;
-}
-
-/// @}
-///
-/// \defgroup ARCAPElim ARC Autorelease Pool Elimination.
-/// @{
-
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/IR/Constants.h"
-
-namespace {
-  /// \brief Autorelease pool elimination.
-  class ObjCARCAPElim : public ModulePass {
-    virtual void getAnalysisUsage(AnalysisUsage &AU) const;
-    virtual bool runOnModule(Module &M);
-
-    static bool MayAutorelease(ImmutableCallSite CS, unsigned Depth = 0);
-    static bool OptimizeBB(BasicBlock *BB);
-
-  public:
-    static char ID;
-    ObjCARCAPElim() : ModulePass(ID) {
-      initializeObjCARCAPElimPass(*PassRegistry::getPassRegistry());
-    }
-  };
-}
-
-char ObjCARCAPElim::ID = 0;
-INITIALIZE_PASS(ObjCARCAPElim,
-                "objc-arc-apelim",
-                "ObjC ARC autorelease pool elimination",
-                false, false)
-
-Pass *llvm::createObjCARCAPElimPass() {
-  return new ObjCARCAPElim();
-}
-
-void ObjCARCAPElim::getAnalysisUsage(AnalysisUsage &AU) const {
-  AU.setPreservesCFG();
-}
-
-/// Interprocedurally determine if calls made by the given call site can
-/// possibly produce autoreleases.
-bool ObjCARCAPElim::MayAutorelease(ImmutableCallSite CS, unsigned Depth) {
-  if (const Function *Callee = CS.getCalledFunction()) {
-    if (Callee->isDeclaration() || Callee->mayBeOverridden())
-      return true;
-    for (Function::const_iterator I = Callee->begin(), E = Callee->end();
-         I != E; ++I) {
-      const BasicBlock *BB = I;
-      for (BasicBlock::const_iterator J = BB->begin(), F = BB->end();
-           J != F; ++J)
-        if (ImmutableCallSite JCS = ImmutableCallSite(J))
-          // This recursion depth limit is arbitrary. It's just great
-          // enough to cover known interesting testcases.
-          if (Depth < 3 &&
-              !JCS.onlyReadsMemory() &&
-              MayAutorelease(JCS, Depth + 1))
-            return true;
-    }
-    return false;
-  }
-
-  return true;
-}
-
-bool ObjCARCAPElim::OptimizeBB(BasicBlock *BB) {
-  bool Changed = false;
-
-  Instruction *Push = 0;
-  for (BasicBlock::iterator I = BB->begin(), E = BB->end(); I != E; ) {
-    Instruction *Inst = I++;
-    switch (GetBasicInstructionClass(Inst)) {
-    case IC_AutoreleasepoolPush:
-      Push = Inst;
-      break;
-    case IC_AutoreleasepoolPop:
-      // If this pop matches a push and nothing in between can autorelease,
-      // zap the pair.
-      if (Push && cast<CallInst>(Inst)->getArgOperand(0) == Push) {
-        Changed = true;
-        DEBUG(dbgs() << "ObjCARCAPElim::OptimizeBB: Zapping push pop "
-                        "autorelease pair:\n"
-                        "                           Pop: " << *Inst << "\n"
-                     << "                           Push: " << *Push << "\n");
-        Inst->eraseFromParent();
-        Push->eraseFromParent();
-      }
-      Push = 0;
-      break;
-    case IC_CallOrUser:
-      if (MayAutorelease(ImmutableCallSite(Inst)))
-        Push = 0;
-      break;
-    default:
-      break;
-    }
-  }
-
-  return Changed;
-}
-
-bool ObjCARCAPElim::runOnModule(Module &M) {
-  if (!EnableARCOpts)
-    return false;
-
-  // If nothing in the Module uses ARC, don't do anything.
-  if (!ModuleHasARC(M))
-    return false;
-
-  // Find the llvm.global_ctors variable, as the first step in
-  // identifying the global constructors. In theory, unnecessary autorelease
-  // pools could occur anywhere, but in practice it's pretty rare. Global
-  // ctors are a place where autorelease pools get inserted automatically,
-  // so it's pretty common for them to be unnecessary, and it's pretty
-  // profitable to eliminate them.
-  GlobalVariable *GV = M.getGlobalVariable("llvm.global_ctors");
-  if (!GV)
-    return false;
-
-  assert(GV->hasDefinitiveInitializer() &&
-         "llvm.global_ctors is uncooperative!");
-
-  bool Changed = false;
-
-  // Dig the constructor functions out of GV's initializer.
-  ConstantArray *Init = cast<ConstantArray>(GV->getInitializer());
-  for (User::op_iterator OI = Init->op_begin(), OE = Init->op_end();
-       OI != OE; ++OI) {
-    Value *Op = *OI;
-    // llvm.global_ctors is an array of pairs where the second members
-    // are constructor functions.
-    Function *F = dyn_cast<Function>(cast<ConstantStruct>(Op)->getOperand(1));
-    // If the user used a constructor function with the wrong signature and
-    // it got bitcasted or whatever, look the other way.
-    if (!F)
-      continue;
-    // Only look at function definitions.
-    if (F->isDeclaration())
-      continue;
-    // Only look at functions with one basic block.
-    if (llvm::next(F->begin()) != F->end())
-      continue;
-    // Ok, a single-block constructor function definition. Try to optimize it.
-    Changed |= OptimizeBB(F->begin());
-  }
-
-  return Changed;
 }
 
 /// @}
@@ -2023,9 +1302,9 @@ Constant *ObjCARCOpt::getAutoreleaseCallee(Module *M) {
 
 /// Test whether the given value is possible a reference-counted pointer,
 /// including tests which utilize AliasAnalysis.
-static bool IsPotentialUse(const Value *Op, AliasAnalysis &AA) {
+static bool IsPotentialRetainableObjPtr(const Value *Op, AliasAnalysis &AA) {
   // First make the rudimentary check.
-  if (!IsPotentialUse(Op))
+  if (!IsPotentialRetainableObjPtr(Op))
     return false;
 
   // Objects in constant memory are not reference-counted.
@@ -2066,7 +1345,7 @@ CanAlterRefCount(const Instruction *Inst, const Value *Ptr,
     for (ImmutableCallSite::arg_iterator I = CS.arg_begin(), E = CS.arg_end();
          I != E; ++I) {
       const Value *Op = *I;
-      if (IsPotentialUse(Op, *PA.getAA()) && PA.related(Ptr, Op))
+      if (IsPotentialRetainableObjPtr(Op, *PA.getAA()) && PA.related(Ptr, Op))
         return true;
     }
     return false;
@@ -2091,14 +1370,14 @@ CanUse(const Instruction *Inst, const Value *Ptr, ProvenanceAnalysis &PA,
     // Comparing a pointer with null, or any other constant, isn't really a use,
     // because we don't care what the pointer points to, or about the values
     // of any other dynamic reference-counted pointers.
-    if (!IsPotentialUse(ICI->getOperand(1), *PA.getAA()))
+    if (!IsPotentialRetainableObjPtr(ICI->getOperand(1), *PA.getAA()))
       return false;
   } else if (ImmutableCallSite CS = static_cast<const Value *>(Inst)) {
     // For calls, just check the arguments (and not the callee operand).
     for (ImmutableCallSite::arg_iterator OI = CS.arg_begin(),
          OE = CS.arg_end(); OI != OE; ++OI) {
       const Value *Op = *OI;
-      if (IsPotentialUse(Op, *PA.getAA()) && PA.related(Ptr, Op))
+      if (IsPotentialRetainableObjPtr(Op, *PA.getAA()) && PA.related(Ptr, Op))
         return true;
     }
     return false;
@@ -2108,14 +1387,14 @@ CanUse(const Instruction *Inst, const Value *Ptr, ProvenanceAnalysis &PA,
     const Value *Op = GetUnderlyingObjCPtr(SI->getPointerOperand());
     // If we can't tell what the underlying object was, assume there is a
     // dependence.
-    return IsPotentialUse(Op, *PA.getAA()) && PA.related(Op, Ptr);
+    return IsPotentialRetainableObjPtr(Op, *PA.getAA()) && PA.related(Op, Ptr);
   }
 
   // Check each operand for a match.
   for (User::const_op_iterator OI = Inst->op_begin(), OE = Inst->op_end();
        OI != OE; ++OI) {
     const Value *Op = *OI;
-    if (IsPotentialUse(Op, *PA.getAA()) && PA.related(Ptr, Op))
+    if (IsPotentialRetainableObjPtr(Op, *PA.getAA()) && PA.related(Ptr, Op))
       return true;
   }
   return false;

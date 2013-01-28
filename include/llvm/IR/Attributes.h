@@ -107,10 +107,14 @@ private:
 public:
   Attribute() : pImpl(0) {}
 
-  /// \brief Return a uniquified Attribute object. This takes the uniquified
-  /// value from the Builder and wraps it in the Attribute class.
-  static Attribute get(LLVMContext &Context, ArrayRef<AttrKind> Vals);
+  /// \brief Return a uniquified Attribute object.
+  static Attribute get(LLVMContext &Context, ArrayRef<AttrKind> Kinds);
   static Attribute get(LLVMContext &Context, AttrBuilder &B);
+
+  /// \brief Return a uniquified Attribute object that has the specific
+  /// alignment set.
+  static Attribute getWithAlignment(LLVMContext &Context, uint64_t Align);
+  static Attribute getWithStackAlignment(LLVMContext &Context, uint64_t Align);
 
   /// \brief Return true if the attribute is present.
   bool hasAttribute(AttrKind Val) const;
@@ -130,25 +134,21 @@ public:
   bool operator==(AttrKind K) const;
   bool operator!=(AttrKind K) const;
 
+  bool operator==(Attribute A) const { return pImpl == A.pImpl; }
+  bool operator!=(Attribute A) const { return pImpl != A.pImpl; }
+
+  /// \brief Less-than operator. Useful for sorting the attributes list.
   bool operator<(Attribute A) const;
+
+  /// \brief The Attribute is converted to a string of equivalent mnemonic. This
+  /// is, presumably, for writing out the mnemonics for the assembly writer.
+  std::string getAsString() const;
 
   void Profile(FoldingSetNodeID &ID) const {
     ID.AddPointer(pImpl);
   }
 
-  // FIXME: Remove these 'operator' methods.
-  bool operator==(const Attribute &A) const {
-    return pImpl == A.pImpl;
-  }
-  bool operator!=(const Attribute &A) const {
-    return pImpl != A.pImpl;
-  }
-
   uint64_t Raw() const;
-
-  /// \brief The Attribute is converted to a string of equivalent mnemonic. This
-  /// is, presumably, for writing out the mnemonics for the assembly writer.
-  std::string getAsString() const;
 };
 
 //===----------------------------------------------------------------------===//
@@ -177,7 +177,7 @@ template<> struct DenseMapInfo<Attribute::AttrKind> {
 
 class AttrBuilder;
 class AttributeSetImpl;
-struct AttributeWithIndex;
+class AttributeSetNode;
 
 //===----------------------------------------------------------------------===//
 /// \class
@@ -191,37 +191,42 @@ public:
   };
 private:
   friend class AttrBuilder;
+  friend class AttributeSetImpl;
 
   /// \brief The attributes that we are managing.  This can be null to represent
   /// the empty attributes list.
-  AttributeSetImpl *AttrList;
+  AttributeSetImpl *pImpl;
 
   /// \brief The attributes for the specified index are returned.  Attributes
   /// for the result are denoted with Idx = 0.
   Attribute getAttributes(unsigned Idx) const;
 
-  /// \brief Add the specified attribute at the specified index to this
-  /// attribute list.  Since attribute lists are immutable, this returns the new
-  /// list.
-  AttributeSet addAttr(LLVMContext &C, unsigned Idx, Attribute Attrs) const;
+  /// \brief Create an AttributeSet with the specified parameters in it.
+  static AttributeSet get(LLVMContext &C,
+                          ArrayRef<std::pair<uint64_t, Attribute> > Attrs);
+  static AttributeSet get(LLVMContext &C,
+                          ArrayRef<std::pair<uint64_t,
+                                             AttributeSetNode*> > Attrs);
 
-  /// \brief Remove the specified attribute at the specified index from this
-  /// attribute list.  Since attribute lists are immutable, this returns the new
-  /// list.
-  AttributeSet removeAttr(LLVMContext &C, unsigned Idx, Attribute Attrs) const;
+  static AttributeSet getImpl(LLVMContext &C,
+                              ArrayRef<std::pair<uint64_t,
+                                                 AttributeSetNode*> > Attrs);
 
-  explicit AttributeSet(AttributeSetImpl *LI) : AttrList(LI) {}
+
+  explicit AttributeSet(AttributeSetImpl *LI) : pImpl(LI) {}
 public:
-  AttributeSet() : AttrList(0) {}
-  AttributeSet(const AttributeSet &P) : AttrList(P.AttrList) {}
-  const AttributeSet &operator=(const AttributeSet &RHS);
+  AttributeSet() : pImpl(0) {}
+  AttributeSet(const AttributeSet &P) : pImpl(P.pImpl) {}
+  const AttributeSet &operator=(const AttributeSet &RHS) {
+    pImpl = RHS.pImpl;
+    return *this;
+  }
 
   //===--------------------------------------------------------------------===//
   // Attribute List Construction and Mutation
   //===--------------------------------------------------------------------===//
 
   /// \brief Return an AttributeSet with the specified parameters in it.
-  static AttributeSet get(LLVMContext &C, ArrayRef<AttributeWithIndex> Attrs);
   static AttributeSet get(LLVMContext &C, ArrayRef<AttributeSet> Attrs);
   static AttributeSet get(LLVMContext &C, unsigned Idx,
                           ArrayRef<Attribute::AttrKind> Kind);
@@ -262,7 +267,7 @@ public:
                                 AttributeSet Attrs) const;
 
   //===--------------------------------------------------------------------===//
-  // Attribute List Accessors
+  // Attribute Set Accessors
   //===--------------------------------------------------------------------===//
 
   /// \brief The attributes for the specified index are returned.
@@ -274,18 +279,14 @@ public:
   /// \brief The function attributes are returned.
   AttributeSet getFnAttributes() const;
 
-  /// \brief Return the alignment for the specified function parameter.
-  unsigned getParamAlignment(unsigned Idx) const;
-
   /// \brief Return true if the attribute exists at the given index.
   bool hasAttribute(unsigned Index, Attribute::AttrKind Kind) const;
 
   /// \brief Return true if attribute exists at the given index.
   bool hasAttributes(unsigned Index) const;
 
-  /// \brief Returns the alignment field of an attribute as a byte alignment
-  /// value.
-  unsigned getAlignment(unsigned Index) const;
+  /// \brief Return the alignment for the specified function parameter.
+  unsigned getParamAlignment(unsigned Idx) const;
 
   /// \brief Get the stack alignment.
   unsigned getStackAlignment(unsigned Index) const;
@@ -301,10 +302,10 @@ public:
 
   /// operator==/!= - Provide equality predicates.
   bool operator==(const AttributeSet &RHS) const {
-    return AttrList == RHS.AttrList;
+    return pImpl == RHS.pImpl;
   }
   bool operator!=(const AttributeSet &RHS) const {
-    return AttrList != RHS.AttrList;
+    return pImpl != RHS.pImpl;
   }
 
   //===--------------------------------------------------------------------===//
@@ -313,7 +314,7 @@ public:
 
   /// \brief Return a raw pointer that uniquely identifies this attribute list.
   void *getRawPointer() const {
-    return AttrList;
+    return pImpl;
   }
 
   // Attributes are stored as a dense set of slots, where there is one slot for
@@ -322,7 +323,7 @@ public:
 
   /// \brief Return true if there are no attributes.
   bool isEmpty() const {
-    return AttrList == 0;
+    return pImpl == 0;
   }
 
   /// \brief Return the number of slots used in this attribute list.  This is
@@ -331,34 +332,12 @@ public:
   unsigned getNumSlots() const;
 
   /// \brief Return the index for the given slot.
-  unsigned getSlotIndex(unsigned Slot) const;
+  uint64_t getSlotIndex(unsigned Slot) const;
 
   /// \brief Return the attributes at the given slot.
   AttributeSet getSlotAttributes(unsigned Slot) const;
 
   void dump() const;
-};
-
-//===----------------------------------------------------------------------===//
-/// \class
-/// \brief This is just a pair of values to associate a set of attributes with
-/// an index.
-struct AttributeWithIndex {
-  Attribute Attrs;  ///< The attributes that are set, or'd together.
-  unsigned Index;   ///< Index of the parameter for which the attributes apply.
-
-  // FIXME: These methods all need to be revised. The first one is temporary.
-  static AttributeWithIndex get(LLVMContext &C, unsigned Idx, AttributeSet AS);
-  static AttributeWithIndex get(LLVMContext &C, unsigned Idx,
-                                ArrayRef<Attribute::AttrKind> Attrs) {
-    return get(Idx, Attribute::get(C, Attrs));
-  }
-  static AttributeWithIndex get(unsigned Idx, Attribute Attrs) {
-    AttributeWithIndex P;
-    P.Index = Idx;
-    P.Attrs = Attrs;
-    return P;
-  }
 };
 
 //===----------------------------------------------------------------------===//
@@ -389,11 +368,14 @@ public:
   /// \brief Remove an attribute from the builder.
   AttrBuilder &removeAttribute(Attribute::AttrKind Val);
 
-  /// \brief Add the attributes from A to the builder.
-  AttrBuilder &addAttributes(const Attribute &A);
+  /// \brief Add the attributes to the builder.
+  AttrBuilder &addAttributes(Attribute A);
 
-  /// \brief Remove the attributes from A from the builder.
-  AttrBuilder &removeAttributes(const Attribute &A);
+  /// \brief Remove the attributes from the builder.
+  AttrBuilder &removeAttributes(Attribute A);
+
+  /// \brief Add the attributes to the builder.
+  AttrBuilder &addAttributes(AttributeSet A);
 
   /// \brief Return true if the builder has the specified attribute.
   bool contains(Attribute::AttrKind A) const;
